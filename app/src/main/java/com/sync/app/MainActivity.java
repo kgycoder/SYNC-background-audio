@@ -150,7 +150,7 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
-                injectVisibilitySpoof(view);
+                // Page Visibility 스푸핑은 app.js 첫 줄에서 처리
             }
         });
 
