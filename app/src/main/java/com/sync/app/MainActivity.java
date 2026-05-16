@@ -1,10 +1,13 @@
 package com.sync.app;
 
 import android.annotation.SuppressLint;
+import android.content.Intent;
 import android.content.pm.ActivityInfo;
 import android.graphics.Color;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Base64;
 import android.util.Log;
 import android.view.View;
@@ -47,6 +50,16 @@ public class MainActivity extends AppCompatActivity {
     private static final String TAG = "SYNC";
     private WebView webView;
     private WebViewAssetLoader assetLoader;
+
+    // ★ BG: 100ms 마다 resumeTimers() 강제 호출 — 시스템 pauseTimers() 대응
+    private final Handler     resumeHandler  = new Handler(Looper.getMainLooper());
+    private final Runnable    resumeRunnable = new Runnable() {
+        @Override public void run() {
+            try { if (webView != null) webView.resumeTimers(); }
+            catch (Exception ignored) {}
+            resumeHandler.postDelayed(this, 100);
+        }
+    };
 
     private final OkHttpClient http = new OkHttpClient.Builder()
             .followRedirects(true)
@@ -101,6 +114,14 @@ public class MainActivity extends AppCompatActivity {
         webView.setLayerType(View.LAYER_TYPE_HARDWARE, null);
         webView.setBackgroundColor(Color.parseColor("#08080D"));
 
+        // ★ BG: 렌더러 우선순위 최상위 — 백그라운드에서도 스로틀링 안 함
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            webView.setRendererPriorityPolicy(
+                    WebView.RENDERER_PRIORITY_IMPORTANT,
+                    false  // false = 앱 백그라운드에서도 우선순위 유지
+            );
+        }
+
         webView.addJavascriptInterface(new AndroidBridge(), "AndroidBridge");
         webView.setWebChromeClient(new WebChromeClient());
 
@@ -112,11 +133,8 @@ public class MainActivity extends AppCompatActivity {
                         assetLoader.shouldInterceptRequest(request.getUrl());
                 if (response == null) return null;
 
-                // AssetLoader 응답의 MIME만 가져오고
-                // encoding을 UTF-8로 명시한 2인수 생성자 사용 (NPE 없음)
                 String mime = response.getMimeType();
                 if (mime == null) mime = "text/plain";
-                // charset이 이미 붙어 있으면 제거 후 재지정
                 if (mime.contains(";")) mime = mime.substring(0, mime.indexOf(";")).trim();
 
                 return new WebResourceResponse(mime, "UTF-8", response.getData());
@@ -127,41 +145,135 @@ public class MainActivity extends AppCompatActivity {
                     WebView view, WebResourceRequest request) {
                 return false;
             }
+
+            // ★ BG: 페이지 로드 완료 후 Page Visibility 스푸핑 JS 주입
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                super.onPageFinished(view, url);
+                injectVisibilitySpoof(view);
+            }
         });
 
         webView.loadUrl(
                 "https://appassets.androidplatform.net/assets/www/index.html");
+
+        // ★ BG: Foreground Service 시작 (백그라운드 재생 유지)
+        startMusicService();
+
+        // ★ BG: resumeTimers 루프 시작
+        resumeHandler.post(resumeRunnable);
+
+        // ★ BG: 알림 권한 요청 (Android 13+)
+        requestNotificationPermission();
     }
 
-    public class AndroidBridge {
-        @JavascriptInterface
-        public void postMessage(String json) {
-            try {
-                JSONObject msg = new JSONObject(json);
-                String type = msg.optString("type");
-                switch (type) {
-                    case "search":
-                        executor.submit(() -> doSearch(msg)); break;
-                    case "suggest":
-                        executor.submit(() -> doSuggest(msg)); break;
-                    case "fetchLyrics":
-                        executor.submit(() -> doFetchLyrics(msg)); break;
-                    case "orientation":
-                        String orient = msg.optString("value", "sensor");
-                        runOnUiThread(() -> setOrientation(orient)); break;
-                    default: break;
-                }
-            } catch (JSONException e) {
-                Log.e(TAG, "postMessage parse error", e);
+    // ★ BG: Page Visibility API 스푸핑 — YouTube가 백그라운드 인식 못 하게 차단
+    private void injectVisibilitySpoof(WebView view) {
+        String js =
+            "(function(){"
+            + "try{"
+            // document.hidden 항상 false
+            + "Object.defineProperty(document,'hidden',"
+            + "{get:function(){return false;},configurable:true});"
+            // document.visibilityState 항상 'visible'
+            + "Object.defineProperty(document,'visibilityState',"
+            + "{get:function(){return 'visible';},configurable:true});"
+            // visibilitychange 이벤트 등록 차단
+            + "var _origAdd=document.addEventListener.bind(document);"
+            + "document.addEventListener=function(type,fn,opts){"
+            + "if(type==='visibilitychange')return;"
+            + "return _origAdd(type,fn,opts);"
+            + "};"
+            // pagehide / freeze 이벤트 차단
+            + "window.addEventListener('pagehide',function(e){e.stopImmediatePropagation();},true);"
+            + "window.addEventListener('freeze',function(e){e.stopImmediatePropagation();},true);"
+            + "}catch(e){}"
+            + "})();";
+        view.evaluateJavascript(js, null);
+    }
+
+    // ★ BG: Foreground Service 시작
+    private void startMusicService() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                // 알림 채널 미리 생성 (서비스보다 먼저)
+                android.app.NotificationChannel ch = new android.app.NotificationChannel(
+                        MusicKeepAliveService.CHANNEL_ID,
+                        "SYNC 음악 재생",
+                        android.app.NotificationManager.IMPORTANCE_LOW);
+                ch.setShowBadge(false);
+                android.app.NotificationManager nm =
+                        (android.app.NotificationManager)
+                                getSystemService(NOTIFICATION_SERVICE);
+                if (nm != null) nm.createNotificationChannel(ch);
+            }
+            Intent i = new Intent(this, MusicKeepAliveService.class);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(i);
+            } else {
+                startService(i);
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "startMusicService error", e);
+        }
+    }
+
+    private void stopMusicService() {
+        try { stopService(new Intent(this, MusicKeepAliveService.class)); }
+        catch (Exception ignored) {}
+    }
+
+    // ★ BG: 알림 권한 (Android 13+)
+    private void requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
+                    != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(
+                        new String[]{android.Manifest.permission.POST_NOTIFICATIONS},
+                        1002);
             }
         }
+    }
+
+    // ★ BG: setTitle 메시지 처리 → 알림 제목 업데이트
+    private void updateNotificationTitle(String title) {
+        try {
+            sendBroadcast(new Intent(MusicKeepAliveService.ACTION_UPDATE_TITLE)
+                    .putExtra("title", title));
+        } catch (Exception ignored) {}
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    //  생명주기 — onPause에서 WebView.onPause() 호출 제거 (★ BG)
+    // ──────────────────────────────────────────────────────────────
+    @Override
+    protected void onResume() {
+        super.onResume();
+        webView.onResume();
+        webView.resumeTimers();
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        // ★ BG: webView.onPause() 호출하지 않음 — 렌더러 pause 차단
+        // (기존 코드의 webView.onPause() 제거)
+    }
+
+    @Override
+    protected void onDestroy() {
+        // ★ BG: resumeTimers 루프 정지
+        resumeHandler.removeCallbacks(resumeRunnable);
+        stopMusicService();
+        executor.shutdown();
+        webView.destroy();
+        super.onDestroy();
     }
 
     private void sendToJs(JSONObject payload) {
         String b64 = Base64.encodeToString(
                 payload.toString().getBytes(StandardCharsets.UTF_8),
                 Base64.NO_WRAP);
-        // atob()는 Latin-1만 처리 → TextDecoder로 UTF-8 명시 디코딩
         String js =
             "(function(){" +
             "  var b=atob('" + b64 + "');" +
@@ -221,6 +333,36 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    public class AndroidBridge {
+        @JavascriptInterface
+        public void postMessage(String json) {
+            try {
+                JSONObject msg = new JSONObject(json);
+                String type = msg.optString("type");
+                switch (type) {
+                    case "search":
+                        executor.submit(() -> doSearch(msg)); break;
+                    case "suggest":
+                        executor.submit(() -> doSuggest(msg)); break;
+                    case "fetchLyrics":
+                        executor.submit(() -> doFetchLyrics(msg)); break;
+                    case "orientation":
+                        String orient = msg.optString("value", "sensor");
+                        runOnUiThread(() -> setOrientation(orient)); break;
+                    // ★ BG: 재생 중인 곡 제목 → 알림 업데이트
+                    case "setTitle":
+                        String title = msg.optString("title", "SYNC");
+                        runOnUiThread(() -> updateNotificationTitle(title)); break;
+                    default: break;
+                }
+            } catch (JSONException e) {
+                Log.e(TAG, "postMessage parse error", e);
+            }
+        }
+    }
+
+    // ─── 이하 doSearch / doSuggest / doFetchLyrics 등은 원본 그대로 ───
+
     private void doSearch(JSONObject msg) {
         String query = msg.optString("query");
         String id    = msg.optString("id", "0");
@@ -239,7 +381,6 @@ public class MainActivity extends AppCompatActivity {
             JSONObject body = new JSONObject();
             body.put("context", context);
             body.put("query", query);
-            // EgIQAQ== = 영상 검색 필터 (URL인코딩 제거)
             body.put("params", "EgIQAQ==");
 
             Request req = new Request.Builder()
@@ -357,21 +498,17 @@ public class MainActivity extends AppCompatActivity {
 
     private boolean isMusicVideo(String title, String channel, int durSec) {
         String tl = title.toLowerCase(), cl = channel.toLowerCase();
-        // 채널명 키워드
         for (String kw : new String[]{
                 "vevo","topic","music","records","entertainment",
                 "sound","audio","official","label","studio"})
             if (cl.contains(kw)) return true;
-        // 제목 키워드
         for (String kw : new String[]{
                 "official","mv","m/v","music video","audio","lyrics",
                 "lyric","visualizer","live","performance","concert","feat",
                 "뮤직비디오","음원","공식","노래"})
             if (tl.contains(kw)) return true;
-        // 1분 이상 or 길이 미상 → 통과
         return durSec >= 60 || durSec == 0;
     }
-
 
     private void doSuggest(JSONObject msg) {
         String query = msg.optString("query");
@@ -443,15 +580,11 @@ public class MainActivity extends AppCompatActivity {
         } catch (JSONException ignored) {}
     }
 
-    // ════════════════════════════════════════════════════
-    //  1차: lrclib.net — PC 버전 C# 동일 알고리즘 포팅
-    // ════════════════════════════════════════════════════
     private JSONArray tryLrclib(String rawTitle, String channel, double ytDur) {
         try {
             String ct = cleanTitle(rawTitle);
             String ca = cleanArtist(channel);
 
-            // ── 검색 쿼리 변형 목록 (PC 버전과 동일) ──
             String stripped = stripBrackets(ct);
             List<String> queries = new ArrayList<>();
             queries.add(ct + " " + ca);
@@ -460,25 +593,20 @@ public class MainActivity extends AppCompatActivity {
             if (!ca.isEmpty()) queries.add(ca + " " + ct);
             if (!ca.isEmpty() && !stripped.equals(ct)) queries.add(stripped + " " + ca);
 
-            // synced 결과가 나올 때까지 순서대로 시도
             JSONArray results = new JSONArray();
             for (String q : queries) {
                 JSONArray r = searchLrclib(q);
                 if (hasSyncedResults(r)) { results = r; break; }
-                // synced 없어도 결과가 있으면 후보로 보관
                 if (results.length() == 0 && r.length() > 0) results = r;
             }
 
             if (results.length() == 0) return null;
 
-            // ── 후보 채점 (PC 버전 동일 가중치) ──
             String bestLrc   = null;
             double bestScore = Double.NEGATIVE_INFINITY;
 
             for (int i = 0; i < results.length(); i++) {
                 JSONObject item = results.getJSONObject(i);
-
-                // syncedLyrics 우선, 없으면 plainLyrics도 시도
                 String lrcText = item.optString("syncedLyrics", "");
                 if (lrcText.isEmpty()) lrcText = item.optString("plainLyrics", "");
                 if (lrcText.isEmpty()) continue;
@@ -497,7 +625,6 @@ public class MainActivity extends AppCompatActivity {
                 }
                 score += titleSim(ct, item.optString("trackName",  "")) * 30;
                 score += titleSim(ca, item.optString("artistName", "")) * 20;
-                // syncedLyrics 있으면 보너스
                 if (!item.optString("syncedLyrics", "").isEmpty()) score += 10;
 
                 if (score > bestScore) { bestScore = score; bestLrc = lrcText; }
@@ -532,15 +659,11 @@ public class MainActivity extends AppCompatActivity {
         return false;
     }
 
-    // ════════════════════════════════════════════════════
-    //  2차: NetEase Cloud Music — 점수 하한 완화
-    // ════════════════════════════════════════════════════
     private JSONArray tryNetEase(String rawTitle, String channel, double ytDur) {
         try {
             String ct = cleanTitle(rawTitle);
             String ca = cleanArtist(channel);
 
-            // PC 버전과 동일한 쿼리 변형
             String stripped = stripBrackets(ct);
             List<String> queryList = new ArrayList<>();
             queryList.add(ct + " " + ca);
@@ -559,13 +682,11 @@ public class MainActivity extends AppCompatActivity {
             }
             if (ids.isEmpty()) return null;
 
-            // 점수 내림차순 정렬
             Integer[] idx = new Integer[ids.size()];
             for (int i = 0; i < idx.length; i++) idx[i] = i;
             final List<Double> fs = scores;
             Arrays.sort(idx, (a, b) -> Double.compare(fs.get(b), fs.get(a)));
 
-            // 점수 하한 20으로 완화 (PC 버전 C#은 40이었으나 Android는 더 넉넉하게)
             for (int i = 0; i < Math.min(5, idx.length); i++) {
                 if (fs.get(idx[i]) < 20) break;
                 JSONArray lines = fetchNetEaseLrc(ids.get(idx[i])[0]);
@@ -641,14 +762,10 @@ public class MainActivity extends AppCompatActivity {
         } catch (Exception e) { return null; }
     }
 
-    // ══════════════════════════════════════════════════
-    //  LRC 파서 — [mm:ss.xx] / [mm:ss.xxx] 모두 지원
-    // ══════════════════════════════════════════════════
     private static final Pattern CREDIT_RX = Pattern.compile(
             "^\\s*(?:作词|作曲|编曲|混音|制作人|出品|录音|母带" +
             "|OP|SP|厂牌|发行|监制|制作|ISRC|专辑|歌手)\\s*[：:].{0,80}$");
 
-    // 2~3자리 소수 모두 허용: [mm:ss.xx] 또는 [mm:ss.xxx]
     private static final Pattern TS_RX = Pattern.compile(
             "\\[(\\d+):(\\d{2})[.:](\\d{2,3})\\]");
 
@@ -658,18 +775,14 @@ public class MainActivity extends AppCompatActivity {
 
         for (String line : lrc.split("\n")) {
             String trimmed = line.trim();
-            // 타임스탬프 전체 제거 후 텍스트 추출
             String textPart = trimmed
                     .replaceAll("\\[\\d+:\\d{2}[.:]\\d{2,3}\\]", "").trim();
             if (textPart.isEmpty() || CREDIT_RX.matcher(textPart).matches())
                 continue;
 
-            // 한 줄에 타임스탬프 여러 개 처리
-            // 예: [00:12.34][00:45.67]가사텍스트
             Matcher scanner = TS_RX.matcher(trimmed);
             while (scanner.find()) {
                 String msStr = scanner.group(3);
-                // 2자리 = 1/100초, 3자리 = 1/1000초
                 double ms = msStr.length() == 2
                         ? Integer.parseInt(msStr) / 100.0
                         : Integer.parseInt(msStr) / 1000.0;
@@ -680,7 +793,6 @@ public class MainActivity extends AppCompatActivity {
             }
         }
 
-        // 시간순 정렬
         Integer[] idx = new Integer[times.size()];
         for (int i = 0; i < idx.length; i++) idx[i] = i;
         Arrays.sort(idx, (a, b) ->
@@ -692,7 +804,7 @@ public class MainActivity extends AppCompatActivity {
             double start = times.get(ci)[0];
             double end   = (i + 1 < idx.length)
                     ? times.get(idx[i + 1])[0] : start + 5.0;
-            if (end - start < 0.1) end = start + 0.5; // 최소 간격 보장
+            if (end - start < 0.1) end = start + 0.5;
             JSONObject obj = new JSONObject();
             obj.put("start", start);
             obj.put("end",   end);
@@ -702,9 +814,6 @@ public class MainActivity extends AppCompatActivity {
         return result;
     }
 
-    // ══════════════════════════════════════════════════
-    //  헬퍼
-    // ══════════════════════════════════════════════════
     private double titleSim(String a, String b) {
         if (a == null || b == null || a.isEmpty() || b.isEmpty()) return 0;
         a = a.toLowerCase(); b = b.toLowerCase();
@@ -742,7 +851,6 @@ public class MainActivity extends AppCompatActivity {
         return last;
     }
 
-    /** 제목 정제 — 영문 태그만 제거 (한글 제목 파괴 방지) */
     private String cleanTitle(String t) {
         final String TAG_RX =
             "(?i)official\\s*(?:music\\s*)?(?:video|audio|mv|lyric(?:s)?|visualizer)?" +
@@ -777,18 +885,6 @@ public class MainActivity extends AppCompatActivity {
         return c.replaceAll("\\s{2,}", " ").trim();
     }
 
-    @Override protected void onPause()   { super.onPause();   webView.onPause(); }
-    @Override protected void onResume()  { super.onResume();  webView.onResume(); }
-    @Override protected void onDestroy() {
-        super.onDestroy();
-        executor.shutdown();
-        webView.destroy();
-    }
-
-    /**
-     * OkHttp는 Content-Type에 charset이 없으면 Latin-1로 읽음.
-     * 한글 깨짐 방지를 위해 항상 명시적 UTF-8로 바이트를 읽는다.
-     */
     private String readUtf8(Response resp) throws IOException {
         byte[] bytes = resp.body().bytes();
         return new String(bytes, StandardCharsets.UTF_8);
