@@ -1,4 +1,47 @@
 /* ════════════════════════════════════════════
+   PAGE VISIBILITY SPOOF — 백그라운드 재생 핵심
+   YouTube IFrame은 visibilityState가 'hidden'이
+   되면 즉시 재생을 멈춤. JS 레벨에서 항상
+   'visible'로 고정해 백그라운드를 인식 못 하게 함.
+════════════════════════════════════════════ */
+(function () {
+    // document.hidden 항상 false
+    try {
+        Object.defineProperty(document, 'hidden', {
+            get: function () { return false; },
+            configurable: true
+        });
+    } catch (e) {}
+
+    // document.visibilityState 항상 'visible'
+    try {
+        Object.defineProperty(document, 'visibilityState', {
+            get: function () { return 'visible'; },
+            configurable: true
+        });
+    } catch (e) {}
+
+    // visibilitychange 이벤트 등록 자체를 차단
+    var _origDocAdd = document.addEventListener.bind(document);
+    document.addEventListener = function (type, fn, opts) {
+        if (type === 'visibilitychange') return;
+        return _origDocAdd(type, fn, opts);
+    };
+
+    // pagehide / freeze 이벤트 차단 (백그라운드 전환 시그널)
+    window.addEventListener('pagehide', function (e) {
+        e.stopImmediatePropagation();
+    }, true);
+    window.addEventListener('freeze', function (e) {
+        e.stopImmediatePropagation();
+    }, true);
+})();
+
+/* ════════════════════════════════════════════
+   DYNAMIC BACKGROUND — Canvas orbs + beat reactor
+...이하 기존 코드 그대로...
+
+/* ════════════════════════════════════════════
    DYNAMIC BACKGROUND — Canvas orbs + beat reactor
 ════════════════════════════════════════════ */
 const CVS = document.getElementById('bgc'), CX = CVS.getContext('2d');
