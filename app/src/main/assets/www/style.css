@@ -3757,16 +3757,25 @@ body.maximized {
 .bt-overlay-btn { display: none !important; }
 
 /* ── YouTube player: hidden but loaded ── */
+/* ── YouTube player: 실제 크기 유지 + 화면 밖 배치 (백그라운드 재생 필수) ──
+   1px/opacity:0/overflow:hidden 이면 YouTube가 백그라운드 감지 후 정지함.
+   X-WARE 방식: 296×166 실사이즈를 화면 밖 -9999px에 고정.           */
 #yt-player-wrap {
     position: fixed;
-    width: 1px;
-    height: 1px;
-    overflow: hidden;
-    opacity: 0;
-    pointer-events: none;
     top: -9999px;
     left: -9999px;
+    width: 296px;
+    height: 166px;
+    overflow: visible;
+    opacity: 1;
+    pointer-events: none;
     z-index: -1;
+}
+
+#yt-player {
+    width: 296px;
+    height: 166px;
+    display: block;
 }
 
 /* ── Dialog / modals: full screen on mobile ── */
