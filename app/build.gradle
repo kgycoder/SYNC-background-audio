@@ -45,4 +45,6 @@ dependencies {
     implementation 'androidx.webkit:webkit:1.8.0'
     implementation 'com.squareup.okhttp3:okhttp:4.12.0'
     implementation 'org.json:json:20231013'
+    // ★ 백그라운드 서비스 호환
+    implementation 'androidx.core:core:1.12.0'
 }
